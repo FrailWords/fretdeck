@@ -36,7 +36,7 @@ function parseTime(s) {
 function fmtSec(sec) {
   if (sec == null || isNaN(sec)) return "";
   const m = Math.floor(sec / 60);
-  const s = sec % 60;
+  const s = Math.floor(sec % 60);
   return m + ":" + String(s).padStart(2, "0");
 }
 function rangeLabel(p) {
@@ -154,8 +154,6 @@ async function exportPdf(song) {
     y += 16;
   }
   const ordered = orderedParts(song.parts);
-
-  // song map
   doc.setFont("helvetica", "bold");
   doc.setFontSize(11);
   doc.setTextColor(20);
@@ -174,8 +172,6 @@ async function exportPdf(song) {
     y += 12;
   });
   y += 10;
-
-  // per-part tabs
   ordered.forEach((p) => {
     if (y > pageH - margin - 100) {
       doc.addPage();
@@ -212,9 +208,27 @@ async function exportPdf(song) {
     });
     y += 8;
   });
-
   const name = (song.title || "fretdeck").replace(/[^a-z0-9]+/gi, "_").toLowerCase();
   doc.save(name + ".pdf");
+}
+
+/* ---------------- youtube iframe api ---------------- */
+let ytApiPromise = null;
+function loadYTApi() {
+  if (typeof window === "undefined") return Promise.resolve(null);
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise((resolve) => {
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      if (typeof prev === "function") prev();
+      resolve(window.YT);
+    };
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.body.appendChild(tag);
+  });
+  return ytApiPromise;
 }
 
 /* ---------------- component ---------------- */
@@ -226,19 +240,42 @@ export default function FretDeck() {
   const [hasDb, setHasDb] = useState(true);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("saved");
-  const [seek, setSeek] = useState({ sec: 0, nonce: 0, auto: false });
   const [toast, setToast] = useState("");
+  const [follow, setFollow] = useState(true);
+  const [currentPartId, setCurrentPartId] = useState(null);
 
   const saveTimers = useRef({});
   const pendingRef = useRef({ v: "", t: 0, cell: "" });
   const toastT = useRef(null);
   const sheetRef = useRef(null);
   const fileRef = useRef(null);
+  const ytHostRef = useRef(null);
+  const playerRef = useRef(null);
+  const rafRef = useRef(0);
+  const playheadRef = useRef(null);
+  const timingRef = useRef({ start: 0, end: 0, segs: [] });
+  const lastSegRef = useRef(null);
+  const followRef = useRef(true);
 
   const activeSong = songs.find((s) => s.id === activeSongId) || null;
   const activePart =
     (activeSong && (activeSong.parts.find((p) => p.id === activePartId) || activeSong.parts[0])) || null;
   const ordered = activeSong ? orderedParts(activeSong.parts) : [];
+  const vid = videoId(activeSong?.youtubeUrl);
+
+  /* build the time axis for the song map (used for layout + playhead) */
+  const segList = [];
+  ordered.forEach((p) => {
+    const a = parseTime(p.start);
+    if (a != null) segList.push({ id: p.id, a, b: parseTime(p.end) });
+  });
+  for (let i = 0; i < segList.length; i++) {
+    if (segList[i].b == null) segList[i].b = segList[i + 1] ? segList[i + 1].a : segList[i].a + 10;
+  }
+  const mapStart = segList.length ? Math.min(...segList.map((s) => s.a)) : 0;
+  const mapEnd = segList.length ? Math.max(...segList.map((s) => s.b)) : 0;
+  const mapSpan = mapEnd - mapStart || 1;
+  timingRef.current = { start: mapStart, end: mapEnd, segs: segList };
 
   const showToast = (m) => {
     setToast(m);
@@ -246,7 +283,94 @@ export default function FretDeck() {
     toastT.current = setTimeout(() => setToast(""), 1600);
   };
 
-  /* load */
+  /* ---- playback follow loop ---- */
+  const tick = useCallback(() => {
+    const p = playerRef.current;
+    const { start, end, segs } = timingRef.current;
+    if (p && p.getCurrentTime) {
+      const t = p.getCurrentTime() || 0;
+      const span = end - start;
+      if (playheadRef.current) {
+        if (span > 0 && t >= start - 0.3 && t <= end + 0.3) {
+          const pct = Math.max(0, Math.min(100, ((t - start) / span) * 100));
+          playheadRef.current.style.left = pct + "%";
+          playheadRef.current.style.opacity = "1";
+        } else {
+          playheadRef.current.style.opacity = "0";
+        }
+      }
+      const seg = (segs || []).find((s) => t >= s.a && (s.b == null || t < s.b));
+      const id = seg ? seg.id : null;
+      if (id !== lastSegRef.current) {
+        lastSegRef.current = id;
+        setCurrentPartId(id);
+        if (id && followRef.current) setActivePartId(id);
+      }
+    }
+    rafRef.current = requestAnimationFrame(tick);
+  }, []);
+  const startLoop = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(tick);
+  }, [tick]);
+  const stopLoop = useCallback(() => cancelAnimationFrame(rafRef.current), []);
+
+  useEffect(() => {
+    followRef.current = follow;
+  }, [follow]);
+
+  /* ---- create / update the YouTube player ---- */
+  useEffect(() => {
+    if (!vid) {
+      if (playerRef.current) {
+        try {
+          playerRef.current.destroy();
+        } catch (e) {}
+        playerRef.current = null;
+      }
+      if (ytHostRef.current) ytHostRef.current.innerHTML = "";
+      return;
+    }
+    let cancelled = false;
+    loadYTApi().then((YT) => {
+      if (cancelled || !YT || !ytHostRef.current) return;
+      if (playerRef.current && playerRef.current.cueVideoById) {
+        playerRef.current.cueVideoById(vid);
+        return;
+      }
+      const host = document.createElement("div");
+      ytHostRef.current.innerHTML = "";
+      ytHostRef.current.appendChild(host);
+      playerRef.current = new YT.Player(host, {
+        videoId: vid,
+        playerVars: { rel: 0, playsinline: 1, modestbranding: 1 },
+        events: {
+          onStateChange: (e) => {
+            const PS = window.YT.PlayerState;
+            if (e.data === PS.PLAYING) startLoop();
+            else if (e.data === PS.PAUSED || e.data === PS.ENDED) stopLoop();
+          },
+        },
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [vid, startLoop, stopLoop]);
+
+  useEffect(
+    () => () => {
+      cancelAnimationFrame(rafRef.current);
+      if (playerRef.current) {
+        try {
+          playerRef.current.destroy();
+        } catch (e) {}
+      }
+    },
+    []
+  );
+
+  /* load library */
   useEffect(() => {
     (async () => {
       try {
@@ -262,11 +386,12 @@ export default function FretDeck() {
     })();
   }, []);
 
-  /* reset player + selection when switching songs */
+  /* reset selection when switching songs */
   useEffect(() => {
-    setSeek({ sec: 0, nonce: Date.now(), auto: false });
     setSel(null);
     setActivePartId(null);
+    setCurrentPartId(null);
+    lastSegRef.current = null;
   }, [activeSongId]);
 
   /* persistence */
@@ -291,7 +416,6 @@ export default function FretDeck() {
     },
     [saveSong]
   );
-
   const updateActiveSong = useCallback(
     (mut) => {
       setSongs((prev) =>
@@ -375,8 +499,7 @@ export default function FretDeck() {
       const p = s.parts.find((p) => p.id === (activePartId || s.parts[0]?.id));
       if (!p) return;
       if (sel.slot < p.slots.length) p.slots[sel.slot][sel.str] = v;
-      if (adv && v !== null && sel.slot >= p.slots.length - 1)
-        p.slots.push([null, null, null, null, null, null]);
+      if (adv && v !== null && sel.slot >= p.slots.length - 1) p.slots.push([null, null, null, null, null, null]);
     });
     if (adv && v !== null) setSel((se) => ({ slot: se.slot + 1, str: se.str }));
   }
@@ -453,13 +576,14 @@ export default function FretDeck() {
     });
   }
 
-  /* player */
-  const vid = videoId(activeSong?.youtubeUrl);
-  const embedSrc = vid
-    ? `https://www.youtube.com/embed/${vid}?start=${seek.sec}&rel=0${seek.auto ? "&autoplay=1" : ""}`
-    : "";
+  /* player control */
   function playFrom(part) {
-    setSeek({ sec: parseTime(part.start) || 0, nonce: Date.now(), auto: true });
+    const sec = parseTime(part.start) || 0;
+    const p = playerRef.current;
+    if (p && p.seekTo) {
+      p.seekTo(sec, true);
+      p.playVideo();
+    }
   }
 
   /* exports */
@@ -567,10 +691,7 @@ export default function FretDeck() {
               <div className="meta">
                 <div className="field f-title">
                   <label>Song</label>
-                  <input
-                    value={activeSong.title}
-                    onChange={(e) => updateActiveSong((s) => (s.title = e.target.value))}
-                  />
+                  <input value={activeSong.title} onChange={(e) => updateActiveSong((s) => (s.title = e.target.value))} />
                 </div>
                 <div className="field f-artist">
                   <label>Artist</label>
@@ -589,284 +710,310 @@ export default function FretDeck() {
                 </div>
               </div>
 
-              <div className="tube">
-                <div className="ratio">
-                  {embedSrc ? (
-                    <iframe
-                      key={vid + "-" + seek.nonce}
-                      src={embedSrc}
-                      allow="autoplay; encrypted-media; picture-in-picture"
-                      allowFullScreen
-                    />
+              <div className="workspace">
+                {/* ---- context column ---- */}
+                <section className="context">
+                  <div className="tube">
+                    <div className="ratio">
+                      <div className="yt-host" ref={ytHostRef} />
+                      {!vid && <div className="empty">Paste a YouTube link above to listen along.</div>}
+                    </div>
+                  </div>
+
+                  <div className="map-head">
+                    <span className="sec-label">Song map</span>
+                    <label className="follow">
+                      <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />
+                      follow playback
+                    </label>
+                  </div>
+                  {segList.length ? (
+                    <div className="timeline-track">
+                      {segList.map((s) => {
+                        const p = ordered.find((x) => x.id === s.id);
+                        const left = ((s.a - mapStart) / mapSpan) * 100;
+                        const width = Math.max(2.5, ((s.b - s.a) / mapSpan) * 100);
+                        return (
+                          <div
+                            key={s.id}
+                            className={
+                              "tl-block" +
+                              (p.id === activePart?.id ? " active" : "") +
+                              (s.id === currentPartId ? " playing" : "")
+                            }
+                            style={{ left: left + "%", width: width + "%", background: TYPE_COLOR[p.type] || "#8a93a0" }}
+                            onClick={() => {
+                              setActivePartId(p.id);
+                              playFrom(p);
+                            }}
+                          >
+                            <div className="nm">{p.name}</div>
+                            <div className="tm">{rangeLabel(p)}</div>
+                          </div>
+                        );
+                      })}
+                      <div className="playhead" ref={playheadRef} />
+                    </div>
                   ) : (
-                    <div className="empty">Paste a YouTube link above to listen along.</div>
+                    <div className="timeline">
+                      <div className="tl-empty">Add start/end times to a part to build the timeline.</div>
+                    </div>
                   )}
-                </div>
-              </div>
 
-              <div className="sec-label">Song map</div>
-              <div className="timeline">
-                {ordered.length ? (
-                  ordered.map((p) => {
-                    const a = parseTime(p.start);
-                    const b = parseTime(p.end);
-                    const dur = a != null && b != null ? Math.max(1, b - a) : 1;
-                    return (
-                      <div
-                        key={p.id}
-                        className={"tl-block" + (p.id === activePart?.id ? " active" : "")}
-                        style={{ background: TYPE_COLOR[p.type] || "#8a93a0", flexGrow: dur }}
-                        onClick={() => {
-                          setActivePartId(p.id);
-                          playFrom(p);
-                        }}
-                      >
-                        <div className="nm">{p.name}</div>
-                        <div className="tm">{rangeLabel(p)}</div>
-                      </div>
-                    );
-                  })
-                ) : (
-                  <div className="tl-empty">No parts yet — add one below.</div>
-                )}
-              </div>
-
-              <div className="sec-label">Parts</div>
-              <div className="road">
-                {ordered.map((p) => (
-                  <div
-                    key={p.id}
-                    className={"road-row" + (p.id === activePart?.id ? " active" : "")}
-                    onClick={() => setActivePartId(p.id)}
-                  >
-                    <span className="chip" style={{ background: TYPE_COLOR[p.type] || "#8a93a0" }} />
-                    <span className="time">{rangeLabel(p)}</span>
-                    <div className="info">
-                      <div>
-                        <span className="nm">{p.name}</span>
-                        <span className="ty">{p.type}</span>
-                      </div>
-                      <div className="fx">{fxSummary(p.fx)}</div>
-                    </div>
-                    <div className="acts">
-                      <button
-                        className="iconbtn"
-                        title="Play from here"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          playFrom(p);
-                        }}
-                      >
-                        ▶
-                      </button>
-                      <button
-                        className="iconbtn"
-                        title="Duplicate"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          duplicatePart(p);
-                        }}
-                      >
-                        ⧉
-                      </button>
-                      <button
-                        className="iconbtn danger"
-                        title="Delete"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deletePart(p.id);
-                        }}
-                      >
-                        ×
-                      </button>
-                    </div>
+                  <div className="sec-label" style={{ marginTop: 18 }}>
+                    Parts
                   </div>
-                ))}
-              </div>
-              <button className="add-part" onClick={addPart}>
-                + Add part
-              </button>
-
-              {activePart && (
-                <div className="editor">
-                  <div className="ed-head">
-                    <div className="field">
-                      <label>Part name</label>
-                      <input
-                        value={activePart.name}
-                        onChange={(e) => updateActivePart((p) => (p.name = e.target.value))}
-                      />
-                    </div>
-                    <div className="field">
-                      <label>Type</label>
-                      <select
-                        value={activePart.type}
-                        onChange={(e) => updateActivePart((p) => (p.type = e.target.value))}
-                      >
-                        {TYPES.map((t) => (
-                          <option key={t}>{t}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="field">
-                      <label>Start</label>
-                      <input
-                        placeholder="0:00"
-                        value={activePart.start}
-                        onChange={(e) => updateActivePart((p) => (p.start = e.target.value))}
-                      />
-                    </div>
-                    <div className="field">
-                      <label>End</label>
-                      <input
-                        placeholder="0:00"
-                        value={activePart.end}
-                        onChange={(e) => updateActivePart((p) => (p.end = e.target.value))}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="fx">
-                    <div className="field">
-                      <label>Drive</label>
-                      <select
-                        value={activePart.fx.drive}
-                        onChange={(e) => updateActivePart((p) => (p.fx.drive = e.target.value))}
-                      >
-                        {DRIVES.map((d) => (
-                          <option key={d}>{d}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="field f-delay">
-                      <label>Delay (ms)</label>
-                      <input
-                        type="number"
-                        placeholder="0"
-                        value={activePart.fx.delay}
-                        onChange={(e) => updateActivePart((p) => (p.fx.delay = e.target.value))}
-                      />
-                    </div>
-                    <div className="field">
-                      <label>Reverb</label>
-                      <select
-                        value={activePart.fx.reverb}
-                        onChange={(e) => updateActivePart((p) => (p.fx.reverb = e.target.value))}
-                      >
-                        {REVERBS.map((r) => (
-                          <option key={r}>{r}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="field f-other">
-                      <label>Other FX</label>
-                      <input
-                        placeholder="chorus, wah, octave…"
-                        value={activePart.fx.other}
-                        onChange={(e) => updateActivePart((p) => (p.fx.other = e.target.value))}
-                      />
-                    </div>
-                    <div className="field f-notes">
-                      <label>Notes</label>
-                      <input
-                        placeholder="capo 2, drop D, pick near bridge…"
-                        value={activePart.fx.notes}
-                        onChange={(e) => updateActivePart((p) => (p.fx.notes = e.target.value))}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="sheet" tabIndex={0} ref={sheetRef} onKeyDown={onKey}>
-                    <div className="grid">
-                      {STRINGS.map((s, si) => (
-                        <div className="grow" key={si}>
-                          <div className="gut">{s}</div>
-                          <div className="lane">
-                            {activePart.slots.map((col, ci) => {
-                              const v = col[si];
-                              const isSel = sel && sel.slot === ci && sel.str === si;
-                              return (
-                                <div
-                                  key={ci}
-                                  className={
-                                    "cell" + (ci > 0 && ci % BAR === 0 ? " bar" : "") + (isSel ? " sel" : "")
-                                  }
-                                  onClick={() => {
-                                    setSel({ slot: ci, str: si });
-                                    sheetRef.current?.focus();
-                                  }}
-                                >
-                                  {v == null ? <span className="dot" /> : <span className="num">{v}</span>}
-                                </div>
-                              );
-                            })}
+                  <div className="parts-scroll">
+                    <div className="road">
+                      {ordered.map((p) => (
+                        <div
+                          key={p.id}
+                          className={
+                            "road-row" +
+                            (p.id === activePart?.id ? " active" : "") +
+                            (p.id === currentPartId ? " playing" : "")
+                          }
+                          onClick={() => setActivePartId(p.id)}
+                        >
+                          <span className="chip" style={{ background: TYPE_COLOR[p.type] || "#8a93a0" }} />
+                          <span className="time">{rangeLabel(p)}</span>
+                          <div className="info">
+                            <div>
+                              <span className="nm">{p.name}</span>
+                              <span className="ty">{p.type}</span>
+                            </div>
+                            <div className="fx">{fxSummary(p.fx)}</div>
+                          </div>
+                          <div className="acts">
+                            <button
+                              className="iconbtn"
+                              title="Play from here"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                playFrom(p);
+                              }}
+                            >
+                              ▶
+                            </button>
+                            <button
+                              className="iconbtn"
+                              title="Duplicate"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                duplicatePart(p);
+                              }}
+                            >
+                              ⧉
+                            </button>
+                            <button
+                              className="iconbtn danger"
+                              title="Delete"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deletePart(p.id);
+                              }}
+                            >
+                              ×
+                            </button>
                           </div>
                         </div>
                       ))}
                     </div>
-                    <div className="sheet-foot">
-                      <button className="mini" onClick={() => addSlots(4)}>
-                        + 4 slots
-                      </button>
-                      <button className="mini" onClick={() => addSlots(BAR)}>
-                        + bar
-                      </button>
-                      <button className="mini" onClick={delSlot}>
-                        – slot
-                      </button>
-                      <button className="mini" onClick={clearPart}>
-                        clear
-                      </button>
+                  </div>
+                  <button className="add-part" onClick={addPart}>
+                    + Add part
+                  </button>
+                </section>
+
+                {/* ---- editor column ---- */}
+                <section className="edit-col">
+                  {activePart ? (
+                    <div className="editor">
+                      <div className="ed-title">
+                        Editing: <b>{activePart.name}</b>
+                      </div>
+                      <div className="ed-head">
+                        <div className="field">
+                          <label>Part name</label>
+                          <input
+                            value={activePart.name}
+                            onChange={(e) => updateActivePart((p) => (p.name = e.target.value))}
+                          />
+                        </div>
+                        <div className="field">
+                          <label>Type</label>
+                          <select
+                            value={activePart.type}
+                            onChange={(e) => updateActivePart((p) => (p.type = e.target.value))}
+                          >
+                            {TYPES.map((t) => (
+                              <option key={t}>{t}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="field">
+                          <label>Start</label>
+                          <input
+                            placeholder="0:00"
+                            value={activePart.start}
+                            onChange={(e) => updateActivePart((p) => (p.start = e.target.value))}
+                          />
+                        </div>
+                        <div className="field">
+                          <label>End</label>
+                          <input
+                            placeholder="0:00"
+                            value={activePart.end}
+                            onChange={(e) => updateActivePart((p) => (p.end = e.target.value))}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="fx">
+                        <div className="field">
+                          <label>Drive</label>
+                          <select
+                            value={activePart.fx.drive}
+                            onChange={(e) => updateActivePart((p) => (p.fx.drive = e.target.value))}
+                          >
+                            {DRIVES.map((d) => (
+                              <option key={d}>{d}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="field f-delay">
+                          <label>Delay (ms)</label>
+                          <input
+                            type="number"
+                            placeholder="0"
+                            value={activePart.fx.delay}
+                            onChange={(e) => updateActivePart((p) => (p.fx.delay = e.target.value))}
+                          />
+                        </div>
+                        <div className="field">
+                          <label>Reverb</label>
+                          <select
+                            value={activePart.fx.reverb}
+                            onChange={(e) => updateActivePart((p) => (p.fx.reverb = e.target.value))}
+                          >
+                            {REVERBS.map((r) => (
+                              <option key={r}>{r}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="field f-other">
+                          <label>Other FX</label>
+                          <input
+                            placeholder="chorus, wah, octave…"
+                            value={activePart.fx.other}
+                            onChange={(e) => updateActivePart((p) => (p.fx.other = e.target.value))}
+                          />
+                        </div>
+                        <div className="field f-notes">
+                          <label>Notes</label>
+                          <input
+                            placeholder="capo 2, drop D, pick near bridge…"
+                            value={activePart.fx.notes}
+                            onChange={(e) => updateActivePart((p) => (p.fx.notes = e.target.value))}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="sheet" tabIndex={0} ref={sheetRef} onKeyDown={onKey}>
+                        <div className="grid">
+                          {STRINGS.map((s, si) => (
+                            <div className="grow" key={si}>
+                              <div className="gut">{s}</div>
+                              <div className="lane">
+                                {activePart.slots.map((col, ci) => {
+                                  const v = col[si];
+                                  const isSel = sel && sel.slot === ci && sel.str === si;
+                                  return (
+                                    <div
+                                      key={ci}
+                                      className={"cell" + (ci > 0 && ci % BAR === 0 ? " bar" : "") + (isSel ? " sel" : "")}
+                                      onClick={() => {
+                                        setSel({ slot: ci, str: si });
+                                        sheetRef.current?.focus();
+                                      }}
+                                    >
+                                      {v == null ? <span className="dot" /> : <span className="num">{v}</span>}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="sheet-foot">
+                          <button className="mini" onClick={() => addSlots(4)}>
+                            + 4 slots
+                          </button>
+                          <button className="mini" onClick={() => addSlots(BAR)}>
+                            + bar
+                          </button>
+                          <button className="mini" onClick={delSlot}>
+                            – slot
+                          </button>
+                          <button className="mini" onClick={clearPart}>
+                            clear
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="palette">
+                        <span className="pl">Fret</span>
+                        {Array.from({ length: 16 }, (_, f) => (
+                          <button key={f} className="fret" onClick={() => setFret(f, true)}>
+                            {f}
+                          </button>
+                        ))}
+                        <button className="fret special" onClick={() => setFret("x", true)}>
+                          x
+                        </button>
+                        <button className="fret special" onClick={() => setFret(null, false)}>
+                          ⌫
+                        </button>
+                      </div>
+                      <div className="hint">
+                        Click a cell, then a fret (auto-advances). Keys: <kbd>0–24</kbd> fret · <kbd>← ↑ ↓ →</kbd> move ·{" "}
+                        <kbd>x</kbd> mute · <kbd>⌫</kbd> clear · <kbd>space</kbd> next.
+                      </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="editor">
+                      <div className="loading">Select a part on the left to edit it.</div>
+                    </div>
+                  )}
 
-                  <div className="palette">
-                    <span className="pl">Fret</span>
-                    {Array.from({ length: 16 }, (_, f) => (
-                      <button key={f} className="fret" onClick={() => setFret(f, true)}>
-                        {f}
-                      </button>
-                    ))}
-                    <button className="fret special" onClick={() => setFret("x", true)}>
-                      x
+                  <div className="exports">
+                    <button className="btn primary" onClick={() => exportPdf(activeSong)}>
+                      Download PDF
                     </button>
-                    <button className="fret special" onClick={() => setFret(null, false)}>
-                      ⌫
+                    <button className="btn" onClick={() => copyToClip(buildAscii(activeSong), "Tab text copied")}>
+                      Copy tab text
                     </button>
+                    <button
+                      className="btn"
+                      onClick={() => copyToClip(typeof window !== "undefined" ? window.location.href : "", "App link copied")}
+                    >
+                      Copy app link
+                    </button>
+                    <button className="btn" onClick={exportJson}>
+                      Export JSON
+                    </button>
+                    <button className="btn" onClick={() => fileRef.current?.click()}>
+                      Import JSON
+                    </button>
+                    <input
+                      ref={fileRef}
+                      type="file"
+                      accept="application/json"
+                      style={{ display: "none" }}
+                      onChange={importJson}
+                    />
                   </div>
-                  <div className="hint">
-                    Click a cell, then a fret (auto-advances). Keys: <kbd>0–24</kbd> fret · <kbd>← ↑ ↓ →</kbd>{" "}
-                    move · <kbd>x</kbd> mute · <kbd>⌫</kbd> clear · <kbd>space</kbd> next.
-                  </div>
-                </div>
-              )}
-
-              <div className="exports">
-                <button className="btn primary" onClick={() => exportPdf(activeSong)}>
-                  Download PDF
-                </button>
-                <button className="btn" onClick={() => copyToClip(buildAscii(activeSong), "Tab text copied")}>
-                  Copy tab text
-                </button>
-                <button
-                  className="btn"
-                  onClick={() => copyToClip(typeof window !== "undefined" ? window.location.href : "", "App link copied")}
-                >
-                  Copy app link
-                </button>
-                <button className="btn" onClick={exportJson}>
-                  Export JSON
-                </button>
-                <button className="btn" onClick={() => fileRef.current?.click()}>
-                  Import JSON
-                </button>
-                <input
-                  ref={fileRef}
-                  type="file"
-                  accept="application/json"
-                  style={{ display: "none" }}
-                  onChange={importJson}
-                />
+                </section>
               </div>
             </>
           ) : (

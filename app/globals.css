@@ -188,3 +188,40 @@ a{color:var(--cool)}
 .toast.show{opacity:1}
 .loading{padding:70px 20px;text-align:center;color:var(--text-faint)}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* ===== two-column workspace ===== */
+.workspace{display:grid;grid-template-columns:minmax(340px,0.92fr) 1.08fr;gap:14px;align-items:start;margin-top:14px}
+@media(max-width:1080px){.workspace{grid-template-columns:1fr}}
+.context{position:sticky;top:14px}
+@media(max-width:1080px){.context{position:static}}
+.edit-col{min-width:0}
+
+/* youtube fills its frame */
+.yt-host{position:absolute;inset:0}
+.tube .ratio{padding-top:56.25%}
+.tube .ratio iframe{position:absolute!important;inset:0;width:100%!important;height:100%!important;border:0}
+
+/* song-map header + follow toggle */
+.map-head{display:flex;align-items:center;gap:12px;margin:16px 2px 9px}
+.map-head .sec-label{margin:0}
+.follow{margin-left:auto;display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);
+  font-size:11px;color:var(--text-dim);cursor:pointer;user-select:none}
+.follow input{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+
+/* time-axis song map + playhead */
+.timeline-track{position:relative;height:50px;border:1px solid var(--line);border-radius:9px;overflow:hidden;
+  background:repeating-linear-gradient(90deg,transparent 0,transparent 47px,rgba(255,255,255,.025) 47px,rgba(255,255,255,.025) 48px),var(--bg2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+.timeline-track .tl-block{position:absolute;top:5px;bottom:5px;flex:none;min-width:0;height:auto;
+  padding:6px 8px;overflow:hidden;border-radius:5px}
+.playhead{position:absolute;top:0;bottom:0;width:2px;left:0;background:#fff;opacity:0;z-index:6;pointer-events:none;
+  box-shadow:0 0 6px rgba(255,255,255,.85),0 0 13px rgba(255,255,255,.45);transition:opacity .25s}
+.tl-block.playing{box-shadow:inset 0 1px 0 rgba(255,255,255,.32),0 0 0 2px #fff,0 0 10px rgba(255,255,255,.35)}
+.road-row.playing{box-shadow:inset 3px 0 0 #fff}
+
+/* scrollable parts list keeps video + map in view */
+.parts-scroll{max-height:34vh;overflow:auto;padding-right:2px}
+@media(max-width:1080px){.parts-scroll{max-height:none}}
+
+.ed-title{font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--text-dim);margin-bottom:12px}
+.ed-title b{color:var(--text);font-weight:700}
