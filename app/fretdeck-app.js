@@ -4,7 +4,8 @@ import { useState, useEffect, useRef, useCallback } from "react";
 
 /* ---------------- constants ---------------- */
 const STRINGS = ["e", "B", "G", "D", "A", "E"];
-const BAR = 8; // slots per bar / per wrapped system row
+const BAR = 8;
+const ROW_SLOTS = 16;
 const TYPE_SUGGESTIONS = [
   "Pre-intro", "Intro", "Pre-verse", "Verse", "Post-verse",
   "Pre-chorus", "Chorus", "Post-chorus", "Pre-bridge", "Bridge", "Post-bridge",
@@ -15,10 +16,9 @@ const FAMILY_COLOR = {
   lead: "#d64e6e", solo: "#d64e6e", breakdown: "#c9603a", interlude: "#5aa0a8",
   outro: "#5fae8e", other: "#8a93a0",
 };
-const HASH_PALETTE = [
-  "#6b7787", "#4e9cd6", "#d99a3e", "#e0683e", "#9b6cc9",
-  "#d64e6e", "#5fae8e", "#5aa0a8", "#b07cc6", "#c98a3e",
-];
+const HASH_PALETTE = ["#6b7787", "#4e9cd6", "#d99a3e", "#e0683e", "#9b6cc9", "#d64e6e", "#5fae8e", "#5aa0a8", "#b07cc6", "#c98a3e"];
+const DRIVES = ["Clean", "Crunch", "Overdrive", "Distortion", "Heavy", "Fuzz"];
+const REVERBS = ["None", "Room", "Hall", "Spring", "Plate"];
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
@@ -35,14 +35,14 @@ function parseTime(s) {
   return isNaN(n) ? null : n;
 }
 function fmtSec(sec) {
-  if (sec == null || isNaN(sec)) return "";
+  if (sec == null || isNaN(sec)) return "0:00";
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return m + ":" + String(s).padStart(2, "0");
 }
-function rangeLabel(p) {
-  const a = parseTime(p.start);
-  const b = parseTime(p.end);
+function rangeLabel(plc) {
+  const a = parseTime(plc.start);
+  const b = parseTime(plc.end);
   if (a == null && b == null) return "—";
   return (a == null ? "?" : fmtSec(a)) + "–" + (b == null ? "?" : fmtSec(b));
 }
@@ -60,29 +60,6 @@ function fxSummary(fx) {
   if (fx.other) p.push(fx.other);
   return p.join("  ·  ") || "—";
 }
-function orderedParts(parts) {
-  return [...(parts || [])]
-    .map((p, i) => ({ p, i }))
-    .sort((a, b) => {
-      const x = parseTime(a.p.start);
-      const y = parseTime(b.p.start);
-      if (x == null && y == null) return a.i - b.i;
-      if (x == null) return 1;
-      if (y == null) return -1;
-      return x - y;
-    })
-    .map((o) => o.p);
-}
-function emptyPart(name = "Part", type = "Verse") {
-  return {
-    id: uid(), name, type, start: "", end: "",
-    fx: { drive: "Clean", delay: "", reverb: "None", other: "", notes: "" },
-    slots: Array.from({ length: 16 }, () => [null, null, null, null, null, null]),
-  };
-}
-const DRIVES = ["Clean", "Crunch", "Overdrive", "Distortion", "Heavy", "Fuzz"];
-const REVERBS = ["None", "Room", "Hall", "Spring", "Plate"];
-
 function clampByte(n) { return Math.max(0, Math.min(255, Math.round(n))); }
 function mix(hex, target, amt) {
   const h = hex.replace("#", "");
@@ -104,6 +81,40 @@ function typeColor(type) {
   if (/^post[\s-]/.test(t)) return mix(base, 0x000000, 0.2);
   return base;
 }
+function niceStep(span) {
+  const opts = [5, 10, 15, 30, 60, 120, 300, 600];
+  for (const o of opts) if (span / o <= 10) return o;
+  return 600;
+}
+function defFx() { return { drive: "Clean", delay: "", reverb: "None", other: "", notes: "" }; }
+function emptySlots() { return Array.from({ length: 16 }, () => [null, null, null, null, null, null]); }
+
+/* parts hold content; arrangement holds time-placements that reference a part */
+function normalizeSong(s) {
+  if (s && Array.isArray(s.arrangement) && Array.isArray(s.parts) && (!s.parts[0] || s.parts[0].slots)) {
+    return s;
+  }
+  const parts = [];
+  const arrangement = [];
+  (s.parts || []).forEach((old) => {
+    const pid = old.id || uid();
+    parts.push({ id: pid, name: old.name || "Part", type: old.type || "Verse", fx: old.fx || defFx(), slots: old.slots || emptySlots() });
+    arrangement.push({ id: uid(), partId: pid, start: old.start || "", end: old.end || "" });
+  });
+  return { ...s, parts, arrangement };
+}
+function placementsOrdered(song) {
+  return [...(song.arrangement || [])]
+    .map((a, i) => ({ a, i }))
+    .sort((x, y) => {
+      const p = parseTime(x.a.start), q = parseTime(y.a.start);
+      if (p == null && q == null) return x.i - y.i;
+      if (p == null) return 1;
+      if (q == null) return -1;
+      return p - q;
+    })
+    .map((o) => o.a);
+}
 
 /* ---------------- text + pdf export ---------------- */
 function partAscii(part) {
@@ -121,11 +132,22 @@ function partAscii(part) {
   }).join("\n");
 }
 function buildAscii(song) {
+  const byId = Object.fromEntries((song.parts || []).map((p) => [p.id, p]));
+  const arr = placementsOrdered(song);
   let out = (song.title || "Untitled") + (song.artist ? " — " + song.artist : "") + "\n";
   if (song.youtubeUrl) out += song.youtubeUrl + "\n";
+  out += "\nSONG MAP\n";
+  arr.forEach((plc) => {
+    const p = byId[plc.partId];
+    if (p) out += rangeLabel(plc).padEnd(13) + p.name + "   Tone: " + fxSummary(p.fx) + "\n";
+  });
   out += "\n";
-  orderedParts(song.parts).forEach((p) => {
-    out += "[" + p.name + "]  " + rangeLabel(p) + "   Tone: " + fxSummary(p.fx) + "\n";
+  const seen = new Set();
+  arr.forEach((plc) => {
+    const p = byId[plc.partId];
+    if (!p || seen.has(p.id)) return;
+    seen.add(p.id);
+    out += "[" + p.name + "]\n";
     if (p.fx && p.fx.notes) out += "Notes: " + p.fx.notes + "\n";
     out += partAscii(p) + "\n\n";
   });
@@ -157,25 +179,29 @@ async function exportPdf(song) {
   const doc = new jsPDF({ unit: "pt", format: "letter" });
   const margin = 54, pageH = 792;
   let y = margin;
+  const byId = Object.fromEntries((song.parts || []).map((p) => [p.id, p]));
+  const arr = placementsOrdered(song);
   doc.setFont("helvetica", "bold"); doc.setFontSize(18); doc.setTextColor(20);
   doc.text(song.title || "Untitled", margin, y); y += 18;
   doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(110);
   if (song.artist) { doc.text(song.artist, margin, y); y += 14; }
   if (song.youtubeUrl) { doc.text(song.youtubeUrl, margin, y); y += 16; }
-  const ordered = orderedParts(song.parts);
   doc.setFont("helvetica", "bold"); doc.setFontSize(11); doc.setTextColor(20);
   doc.text("SONG MAP", margin, y); y += 14;
   doc.setFont("courier", "normal"); doc.setFontSize(10); doc.setTextColor(40);
-  ordered.forEach((p) => {
+  arr.forEach((plc) => {
+    const p = byId[plc.partId]; if (!p) return;
     if (y > pageH - margin) { doc.addPage(); y = margin; }
-    doc.text(rangeLabel(p).padEnd(13) + p.name.padEnd(16) + fxSummary(p.fx).replace(/\s+·\s+/g, " · "), margin, y);
+    doc.text(rangeLabel(plc).padEnd(13) + p.name.padEnd(16) + fxSummary(p.fx).replace(/\s+·\s+/g, " · "), margin, y);
     y += 12;
   });
   y += 10;
-  ordered.forEach((p) => {
+  const seen = new Set();
+  arr.forEach((plc) => {
+    const p = byId[plc.partId]; if (!p || seen.has(p.id)) return; seen.add(p.id);
     if (y > pageH - margin - 100) { doc.addPage(); y = margin; }
     doc.setFont("helvetica", "bold"); doc.setFontSize(11); doc.setTextColor(20);
-    doc.text(rangeLabel(p) + "   " + p.name, margin, y); y += 13;
+    doc.text(p.name, margin, y); y += 13;
     doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(110);
     doc.text("Tone: " + fxSummary(p.fx), margin, y); y += 12;
     if (p.fx && p.fx.notes) { doc.text("Notes: " + p.fx.notes, margin, y); y += 12; }
@@ -211,15 +237,17 @@ function loadYTApi() {
 export default function FretDeck() {
   const [songs, setSongs] = useState([]);
   const [activeSongId, setActiveSongId] = useState(null);
-  const [activePartId, setActivePartId] = useState(null);
+  const [activePlacementId, setActivePlacementId] = useState(null);
+  const [editorOpen, setEditorOpen] = useState(false);
   const [sel, setSel] = useState(null);
   const [hasDb, setHasDb] = useState(true);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("saved");
   const [toast, setToast] = useState("");
   const [follow, setFollow] = useState(true);
-  const [currentPartId, setCurrentPartId] = useState(null);
-  const [dragOver, setDragOver] = useState(null);
+  const [currentPlacementId, setCurrentPlacementId] = useState(null);
+  const [playing, setPlaying] = useState(false);
+  const [duration, setDuration] = useState(0);
 
   const saveTimers = useRef({});
   const pendingRef = useRef({ v: "", t: 0, cell: "" });
@@ -230,34 +258,39 @@ export default function FretDeck() {
   const playerRef = useRef(null);
   const rafRef = useRef(0);
   const playheadRef = useRef(null);
-  const timingRef = useRef({ start: 0, end: 0, segs: [] });
+  const timeReadoutRef = useRef(null);
+  const durationRef = useRef(0);
+  const timingRef = useRef({ start: 0, end: 1, segs: [] });
   const lastSegRef = useRef(null);
   const followRef = useRef(true);
   const trackRef = useRef(null);
   const draggingRef = useRef(false);
   const lastSeekRef = useRef(0);
   const lastTimeRef = useRef(0);
-  const dragIndexRef = useRef(null);
+  const clickRef = useRef({ id: null, t: 0 });
 
   const activeSong = songs.find((s) => s.id === activeSongId) || null;
-  const activePart =
-    (activeSong && (activeSong.parts.find((p) => p.id === activePartId) || activeSong.parts[0])) || null;
-  const ordered = activeSong ? orderedParts(activeSong.parts) : [];
+  const arrangement = activeSong ? activeSong.arrangement || [] : [];
+  const partById = {};
+  if (activeSong) (activeSong.parts || []).forEach((p) => (partById[p.id] = p));
+  const placements = activeSong ? placementsOrdered(activeSong) : [];
+  const activePlacement = arrangement.find((a) => a.id === activePlacementId) || null;
+  const activePart = activePlacement ? partById[activePlacement.partId] : null;
+  const linkCount = activePart ? arrangement.filter((a) => a.partId === activePart.id).length : 0;
   const vid = videoId(activeSong?.youtubeUrl);
 
-  /* time axis + overlap lanes for the song map */
+  /* timeline 0 .. (last end or video duration) */
   const segList = [];
-  ordered.forEach((p) => {
-    const a = parseTime(p.start);
-    if (a != null) segList.push({ id: p.id, a, b: parseTime(p.end) });
+  placements.forEach((plc) => {
+    const a = parseTime(plc.start);
+    if (a != null) segList.push({ id: plc.id, partId: plc.partId, a, b: parseTime(plc.end) });
   });
   for (let i = 0; i < segList.length; i++) {
     if (segList[i].b == null) segList[i].b = segList[i + 1] ? segList[i + 1].a : segList[i].a + 10;
   }
-  const mapStart = segList.length ? Math.min(...segList.map((s) => s.a)) : 0;
   const mapEnd = segList.length ? Math.max(...segList.map((s) => s.b)) : 0;
-  const mapSpan = mapEnd - mapStart || 1;
-  timingRef.current = { start: mapStart, end: mapEnd, segs: segList };
+  const spanEnd = Math.max(mapEnd, duration, 1);
+  timingRef.current = { start: 0, end: spanEnd, segs: segList };
   const laneEnds = [];
   const placed = segList.map((s) => {
     let lane = laneEnds.findIndex((end) => end <= s.a + 0.001);
@@ -266,6 +299,9 @@ export default function FretDeck() {
     return { ...s, lane };
   });
   const laneCount = Math.max(1, laneEnds.length);
+  const ticks = [];
+  const step = niceStep(spanEnd);
+  for (let t = 0; t <= spanEnd + 0.01; t += step) ticks.push(t);
 
   const showToast = (m) => {
     setToast(m);
@@ -273,40 +309,43 @@ export default function FretDeck() {
     toastT.current = setTimeout(() => setToast(""), 1600);
   };
 
-  /* ---- playback follow loop ---- */
+  /* ---- loop ---- */
   const tick = useCallback(() => {
     const p = playerRef.current;
     const { start, end, segs } = timingRef.current;
     if (p && p.getCurrentTime) {
       const t = p.getCurrentTime() || 0;
       const span = end - start;
-      if (playheadRef.current) {
-        if (span > 0 && t >= start - 0.3 && t <= end + 0.3) {
-          playheadRef.current.style.left = Math.max(0, Math.min(100, ((t - start) / span) * 100)) + "%";
-          playheadRef.current.style.opacity = "1";
-        } else {
-          playheadRef.current.style.opacity = "0";
-        }
+      if (playheadRef.current && span > 0) {
+        playheadRef.current.style.left = Math.max(0, Math.min(100, ((t - start) / span) * 100)) + "%";
+        playheadRef.current.style.opacity = "1";
       }
+      const dur = p.getDuration ? p.getDuration() : 0;
+      if (timeReadoutRef.current) timeReadoutRef.current.textContent = fmtSec(t) + " / " + fmtSec(dur);
+      if (dur && Math.abs(dur - durationRef.current) > 0.5) { durationRef.current = dur; setDuration(dur); }
       const seg = (segs || []).find((s) => t >= s.a && (s.b == null || t < s.b));
       const id = seg ? seg.id : null;
       if (id !== lastSegRef.current) {
         lastSegRef.current = id;
-        setCurrentPartId(id);
-        if (id && followRef.current) setActivePartId(id);
+        setCurrentPlacementId(id);
+        if (id && followRef.current) setActivePlacementId(id);
       }
     }
     rafRef.current = requestAnimationFrame(tick);
   }, []);
-  const startLoop = useCallback(() => {
-    cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(tick);
-  }, [tick]);
+  const startLoop = useCallback(() => { cancelAnimationFrame(rafRef.current); rafRef.current = requestAnimationFrame(tick); }, [tick]);
   const stopLoop = useCallback(() => cancelAnimationFrame(rafRef.current), []);
 
   useEffect(() => { followRef.current = follow; }, [follow]);
 
-  /* ---- create / update the YouTube player ---- */
+  /* esc closes editor */
+  useEffect(() => {
+    const h = (e) => { if (e.key === "Escape") setEditorOpen(false); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
+
+  /* youtube */
   useEffect(() => {
     if (!vid) {
       if (playerRef.current) { try { playerRef.current.destroy(); } catch (e) {} playerRef.current = null; }
@@ -316,21 +355,20 @@ export default function FretDeck() {
     let cancelled = false;
     loadYTApi().then((YT) => {
       if (cancelled || !YT || !ytHostRef.current) return;
-      if (playerRef.current && playerRef.current.cueVideoById) {
-        playerRef.current.cueVideoById(vid);
-        return;
-      }
+      if (playerRef.current && playerRef.current.cueVideoById) { playerRef.current.cueVideoById(vid); return; }
       const host = document.createElement("div");
       ytHostRef.current.innerHTML = "";
       ytHostRef.current.appendChild(host);
       playerRef.current = new YT.Player(host, {
         videoId: vid,
-        playerVars: { rel: 0, playsinline: 1, modestbranding: 1 },
+        playerVars: { rel: 0, playsinline: 1, modestbranding: 1, controls: 0 },
         events: {
           onStateChange: (e) => {
             const PS = window.YT.PlayerState;
-            if (e.data === PS.PLAYING) startLoop();
-            else if (e.data === PS.PAUSED || e.data === PS.ENDED) stopLoop();
+            const d = e.target.getDuration ? e.target.getDuration() : 0;
+            if (d) { durationRef.current = d; setDuration(d); }
+            if (e.data === PS.PLAYING) { setPlaying(true); startLoop(); }
+            else { setPlaying(false); if (e.data === PS.PAUSED || e.data === PS.ENDED) stopLoop(); }
           },
         },
       });
@@ -343,25 +381,28 @@ export default function FretDeck() {
     if (playerRef.current) { try { playerRef.current.destroy(); } catch (e) {} }
   }, []);
 
-  /* load library */
+  /* load */
   useEffect(() => {
     (async () => {
       try {
         const r = await fetch("/api/songs");
         const j = await r.json();
-        setSongs(j.songs || []);
+        const list = (j.songs || []).map(normalizeSong);
+        setSongs(list);
         setHasDb(j.hasDb !== false);
-        if (j.songs && j.songs.length) setActiveSongId(j.songs[0].id);
+        if (list.length) setActiveSongId(list[0].id);
       } catch (e) { setStatus("error"); }
       setLoading(false);
     })();
   }, []);
 
-  /* reset selection when switching songs */
   useEffect(() => {
     setSel(null);
-    setActivePartId(null);
-    setCurrentPartId(null);
+    setActivePlacementId(null);
+    setCurrentPlacementId(null);
+    setEditorOpen(false);
+    setDuration(0);
+    durationRef.current = 0;
     lastSegRef.current = null;
   }, [activeSongId]);
 
@@ -369,11 +410,7 @@ export default function FretDeck() {
   const saveSong = useCallback(async (song) => {
     setStatus("saving");
     try {
-      const r = await fetch("/api/songs/" + song.id, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(song),
-      });
+      const r = await fetch("/api/songs/" + song.id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(song) });
       if (!r.ok) throw new Error("save failed");
       setStatus("saved");
     } catch (e) { setStatus("error"); }
@@ -383,33 +420,36 @@ export default function FretDeck() {
     saveTimers.current[song.id] = setTimeout(() => saveSong(song), 600);
   }, [saveSong]);
   const updateActiveSong = useCallback((mut) => {
-    setSongs((prev) =>
-      prev.map((s) => {
-        if (s.id !== activeSongId) return s;
-        const ns = structuredClone(s);
-        mut(ns);
-        scheduleSave(ns);
-        return ns;
-      })
-    );
+    setSongs((prev) => prev.map((s) => {
+      if (s.id !== activeSongId) return s;
+      const ns = structuredClone(s);
+      mut(ns);
+      scheduleSave(ns);
+      return ns;
+    }));
   }, [activeSongId, scheduleSave]);
-  const updateActivePart = useCallback((mut) => {
-    updateActiveSong((s) => {
-      const p = s.parts.find((p) => p.id === (activePartId || s.parts[0]?.id));
-      if (p) mut(p, s);
-    });
-  }, [updateActiveSong, activePartId]);
+  const updatePart = useCallback((mut) => {
+    if (!activePart) return;
+    const pid = activePart.id;
+    updateActiveSong((s) => { const p = s.parts.find((p) => p.id === pid); if (p) mut(p); });
+  }, [updateActiveSong, activePart]);
+  const updatePlacement = useCallback((plcId, mut) => {
+    updateActiveSong((s) => { const a = s.arrangement.find((a) => a.id === plcId); if (a) mut(a); });
+  }, [updateActiveSong]);
 
   /* song ops */
   async function addSong() {
-    const song = { id: uid(), title: "New song", artist: "", youtubeUrl: "", parts: [emptyPart("Intro", "Intro")] };
+    const pid = uid();
+    const song = {
+      id: uid(), title: "New song", artist: "", youtubeUrl: "",
+      parts: [{ id: pid, name: "Intro", type: "Intro", fx: defFx(), slots: emptySlots() }],
+      arrangement: [{ id: uid(), partId: pid, start: "", end: "" }],
+    };
     setStatus("saving");
     try {
-      const r = await fetch("/api/songs", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(song),
-      });
+      const r = await fetch("/api/songs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(song) });
       const j = await r.json();
-      const ns = j.song || song;
+      const ns = normalizeSong(j.song || song);
       setSongs((p) => [...p, ns]);
       setActiveSongId(ns.id);
       setStatus("saved");
@@ -424,38 +464,57 @@ export default function FretDeck() {
     try { await fetch("/api/songs/" + id, { method: "DELETE" }); } catch (e) {}
   }
 
-  /* part ops */
+  /* part / placement ops */
   function addPart() {
-    const np = emptyPart("Part", "Verse");
-    updateActiveSong((s) => s.parts.push(np));
-    setActivePartId(np.id);
-  }
-  function duplicatePart(part) {
-    const copy = structuredClone(part);
-    copy.id = uid();
+    const pid = uid();
+    const plcId = uid();
     updateActiveSong((s) => {
-      const idx = s.parts.findIndex((p) => p.id === part.id);
-      s.parts.splice(idx + 1, 0, copy);
+      s.parts.push({ id: pid, name: "Part", type: "Verse", fx: defFx(), slots: emptySlots() });
+      s.arrangement.push({ id: plcId, partId: pid, start: "", end: "" });
     });
-    setActivePartId(copy.id);
+    setActivePlacementId(plcId);
+    setEditorOpen(true);
   }
-  function deletePart(id) {
-    updateActiveSong((s) => { s.parts = s.parts.filter((p) => p.id !== id); });
-    if (id === activePartId) setActivePartId(null);
-  }
-  function reorderParts(from, to) {
-    if (from == null || to == null || from === to) return;
+  function repeatPlacement(plc) {
+    const plcId = uid();
     updateActiveSong((s) => {
-      const [m] = s.parts.splice(from, 1);
-      s.parts.splice(to, 0, m);
+      const i = s.arrangement.findIndex((a) => a.id === plc.id);
+      s.arrangement.splice(i + 1, 0, { id: plcId, partId: plc.partId, start: "", end: "" });
     });
+    setActivePlacementId(plcId);
+    showToast("Linked repeat added — set its time");
   }
+  function makeIndependent(plc) {
+    const newId = uid();
+    updateActiveSong((s) => {
+      const src = s.parts.find((p) => p.id === plc.partId);
+      if (!src) return;
+      const copy = structuredClone(src);
+      copy.id = newId;
+      s.parts.push(copy);
+      const a = s.arrangement.find((a) => a.id === plc.id);
+      if (a) a.partId = newId;
+    });
+    showToast("Now an independent copy");
+  }
+  function deletePlacement(plcId) {
+    updateActiveSong((s) => {
+      const plc = s.arrangement.find((a) => a.id === plcId);
+      s.arrangement = s.arrangement.filter((a) => a.id !== plcId);
+      if (plc && !s.arrangement.some((a) => a.partId === plc.partId)) {
+        s.parts = s.parts.filter((p) => p.id !== plc.partId);
+      }
+    });
+    if (plcId === activePlacementId) { setActivePlacementId(null); setEditorOpen(false); }
+  }
+  function openEditor(plcId) { setActivePlacementId(plcId); setEditorOpen(true); }
 
-  /* tab editing */
+  /* tab editing (on the shared part) */
   function setFret(v, adv) {
-    if (!sel) return;
+    if (!sel || !activePart) return;
+    const pid = activePart.id;
     updateActiveSong((s) => {
-      const p = s.parts.find((p) => p.id === (activePartId || s.parts[0]?.id));
+      const p = s.parts.find((p) => p.id === pid);
       if (!p) return;
       if (sel.slot < p.slots.length) p.slots[sel.slot][sel.str] = v;
       if (adv && v !== null && sel.slot >= p.slots.length - 1) p.slots.push([null, null, null, null, null, null]);
@@ -463,8 +522,10 @@ export default function FretDeck() {
     if (adv && v !== null) setSel((se) => ({ slot: se.slot + 1, str: se.str }));
   }
   function advance() {
+    if (!activePart) return;
+    const pid = activePart.id;
     updateActiveSong((s) => {
-      const p = s.parts.find((p) => p.id === (activePartId || s.parts[0]?.id));
+      const p = s.parts.find((p) => p.id === pid);
       if (p && sel && sel.slot >= p.slots.length - 1) p.slots.push([null, null, null, null, null, null]);
     });
     setSel((se) => ({ slot: (se ? se.slot : 0) + 1, str: se ? se.str : 0 }));
@@ -499,19 +560,22 @@ export default function FretDeck() {
     else if (k === "ArrowDown") { e.preventDefault(); move(0, 1); }
     else if (k === " ") { e.preventDefault(); advance(); }
   }
-  function addSlots(n) { updateActivePart((p) => { for (let i = 0; i < n; i++) p.slots.push([null, null, null, null, null, null]); }); }
-  function delSlot() { updateActivePart((p) => { if (p.slots.length > 1) p.slots.pop(); }); }
-  function clearPart() { updateActivePart((p) => { p.slots = p.slots.map(() => [null, null, null, null, null, null]); }); }
+  function addSlots(n) { if (!activePart) return; const pid = activePart.id; updateActiveSong((s) => { const p = s.parts.find((p) => p.id === pid); if (p) for (let i = 0; i < n; i++) p.slots.push([null, null, null, null, null, null]); }); }
+  function delSlot() { if (!activePart) return; const pid = activePart.id; updateActiveSong((s) => { const p = s.parts.find((p) => p.id === pid); if (p && p.slots.length > 1) p.slots.pop(); }); }
+  function clearTab() { if (!activePart) return; const pid = activePart.id; updateActiveSong((s) => { const p = s.parts.find((p) => p.id === pid); if (p) p.slots = p.slots.map(() => [null, null, null, null, null, null]); }); }
 
-  /* player + scrub */
-  function playFrom(part) {
-    const sec = parseTime(part.start) || 0;
-    const p = playerRef.current;
-    if (p && p.seekTo) { p.seekTo(sec, true); p.playVideo(); }
+  /* transport + scrub + clip drag */
+  function togglePlay() { const p = playerRef.current; if (!p || !p.getPlayerState) return; if (p.getPlayerState() === 1) p.pauseVideo(); else p.playVideo(); }
+  function stopPlay() {
+    const p = playerRef.current; if (!p) return;
+    if (p.seekTo) p.seekTo(0, true);
+    if (p.pauseVideo) p.pauseVideo();
+    if (playheadRef.current) playheadRef.current.style.left = "0%";
+    if (timeReadoutRef.current) timeReadoutRef.current.textContent = "0:00 / " + fmtSec(durationRef.current);
   }
+  function seekTo(sec, play) { const p = playerRef.current; if (p && p.seekTo) { p.seekTo(sec, true); if (play && p.playVideo) p.playVideo(); } }
   function timeFromEvent(e) {
-    const el = trackRef.current;
-    if (!el) return null;
+    const el = trackRef.current; if (!el) return null;
     const rect = el.getBoundingClientRect();
     const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
     const { start, end } = timingRef.current;
@@ -520,20 +584,16 @@ export default function FretDeck() {
     return start + (x / rect.width) * span;
   }
   function scrubMove(e) {
-    const t = timeFromEvent(e);
-    if (t == null) return;
+    const t = timeFromEvent(e); if (t == null) return;
     lastTimeRef.current = t;
     if (playheadRef.current) {
       const { start, end } = timingRef.current;
       playheadRef.current.style.left = Math.max(0, Math.min(100, ((t - start) / (end - start)) * 100)) + "%";
       playheadRef.current.style.opacity = "1";
     }
+    if (timeReadoutRef.current) timeReadoutRef.current.textContent = fmtSec(t) + " / " + fmtSec(durationRef.current);
     const now = performance.now();
-    if (now - lastSeekRef.current > 70) {
-      lastSeekRef.current = now;
-      const p = playerRef.current;
-      if (p && p.seekTo) p.seekTo(t, true);
-    }
+    if (now - lastSeekRef.current > 70) { lastSeekRef.current = now; seekTo(t, false); }
   }
   function onTrackDown(e) {
     const tm = timingRef.current;
@@ -541,13 +601,39 @@ export default function FretDeck() {
     draggingRef.current = true;
     scrubMove(e);
     const mv = (ev) => { if (draggingRef.current) scrubMove(ev); };
+    const up = () => { draggingRef.current = false; seekTo(lastTimeRef.current, true); window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up); };
+    window.addEventListener("pointermove", mv);
+    window.addEventListener("pointerup", up);
+  }
+  function onClipDown(e, plc) {
+    e.stopPropagation();
+    const el = e.currentTarget;
+    const rect = trackRef.current.getBoundingClientRect();
+    const span = timingRef.current.end - timingRef.current.start;
+    const startX = e.clientX;
+    const a0 = parseTime(plc.start) || 0;
+    const b0 = parseTime(plc.end);
+    const dur = (b0 != null ? b0 : a0) - a0;
+    let moved = false, newA = a0;
+    const mv = (ev) => {
+      const dx = ev.clientX - startX;
+      if (Math.abs(dx) > 4) moved = true;
+      if (moved) {
+        newA = Math.max(0, Math.round(a0 + (dx / rect.width) * span));
+        el.style.left = ((newA / (timingRef.current.end || 1)) * 100) + "%";
+      }
+    };
     const up = () => {
-      draggingRef.current = false;
-      const p = playerRef.current;
-      if (p && p.seekTo) p.seekTo(lastTimeRef.current, true);
-      if (p && p.playVideo) p.playVideo();
       window.removeEventListener("pointermove", mv);
       window.removeEventListener("pointerup", up);
+      if (moved) {
+        updatePlacement(plc.id, (a) => { a.start = fmtSec(newA); if (dur > 0) a.end = fmtSec(newA + dur); });
+      } else {
+        const now = Date.now();
+        if (clickRef.current.id === plc.id && now - clickRef.current.t < 350) openEditor(plc.id);
+        else { setActivePlacementId(plc.id); seekTo(a0, true); }
+        clickRef.current = { id: plc.id, t: now };
+      }
     };
     window.addEventListener("pointermove", mv);
     window.addEventListener("pointerup", up);
@@ -571,14 +657,12 @@ export default function FretDeck() {
     if (!file) return;
     try {
       const data = JSON.parse(await file.text());
-      const arr = Array.isArray(data) ? data : [data];
+      const arr = (Array.isArray(data) ? data : [data]).map(normalizeSong);
       setSongs(arr);
       if (arr[0]) setActiveSongId(arr[0].id);
       for (const s of arr) {
         if (!s.id) s.id = uid();
-        await fetch("/api/songs/" + s.id, {
-          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(s),
-        });
+        await fetch("/api/songs/" + s.id, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(s) });
       }
       showToast("Library imported");
     } catch (err) { showToast("Import failed — invalid file"); }
@@ -586,33 +670,67 @@ export default function FretDeck() {
   }
 
   const statusText = { saved: "saved", saving: "saving…", error: "save error" }[status] || "";
-  const systemCount = activePart ? Math.max(1, Math.ceil(activePart.slots.length / BAR)) : 0;
+  const systemCount = activePart ? Math.max(1, Math.ceil(activePart.slots.length / ROW_SLOTS)) : 0;
 
   return (
     <div className="app">
       <datalist id="part-types">
-        {TYPE_SUGGESTIONS.map((t) => (
-          <option key={t} value={t} />
-        ))}
+        {TYPE_SUGGESTIONS.map((t) => (<option key={t} value={t} />))}
       </datalist>
 
       <header className="deck">
         <div className="brand">
           <span className="pilot" />
-          <div>
-            <h1>FRETDECK</h1>
-            <small>SHARED SONG ROADMAP</small>
-          </div>
+          <div><h1>FRETDECK</h1><small>SHARED SONG ROADMAP</small></div>
         </div>
-        <div className={"status " + status}>
-          <b>●</b> {statusText}
-        </div>
+        <div className={"status " + status}><b>●</b> {statusText}</div>
       </header>
 
       {!hasDb && (
         <div className="banner">
           No database connected — edits won&apos;t persist. Add a <b>Neon Postgres</b> store in your Vercel
-          project&apos;s <b>Storage</b> tab (it sets <code>DATABASE_URL</code> automatically), then redeploy.
+          project&apos;s <b>Storage</b> tab, then redeploy.
+        </div>
+      )}
+
+      {activeSong && (
+        <div className="transport">
+          <div className="tbar">
+            <button className="tb-btn play" onClick={togglePlay} title="Play / Pause">{playing ? "⏸" : "▶"}</button>
+            <button className="tb-btn" onClick={stopPlay} title="Stop">⏹</button>
+            <span className="tcode" ref={timeReadoutRef}>0:00 / 0:00</span>
+            <label className="follow"><input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />follow</label>
+            <span className="tb-title">{activeSong.title}</span>
+            <div className="mini-video"><div className="mv-host" ref={ytHostRef} />{!vid && <div className="mv-empty">no video</div>}</div>
+          </div>
+          {segList.length ? (
+            <>
+              <div className="ruler">
+                {ticks.map((tk, i) => (<span key={i} className="rtick" style={{ left: (tk / spanEnd) * 100 + "%" }}>{fmtSec(tk)}</span>))}
+              </div>
+              <div className="timeline-track" ref={trackRef} onPointerDown={onTrackDown} style={{ height: 12 + laneCount * 38 }}>
+                {placed.map((s) => {
+                  const p = partById[s.partId];
+                  const left = (s.a / spanEnd) * 100;
+                  const width = Math.max(1.2, ((s.b - s.a) / spanEnd) * 100);
+                  const linked = arrangement.filter((a) => a.partId === s.partId).length > 1;
+                  return (
+                    <div key={s.id}
+                      className={"tl-block" + (s.id === activePlacementId ? " active" : "") + (s.id === currentPlacementId ? " playing" : "")}
+                      style={{ left: left + "%", width: width + "%", top: 6 + s.lane * 38, height: 32, background: typeColor(p?.type) }}
+                      onPointerDown={(e) => onClipDown(e, s)}>
+                      <div className="nm">{p?.name}{linked ? " ⟲" : ""}</div>
+                      <div className="tm">{rangeLabel(s)}</div>
+                    </div>
+                  );
+                })}
+                <div className="playhead" ref={playheadRef} />
+              </div>
+              <div className="scrub-hint">drag a clip to move it · drag empty space to scrub · double-click a clip to edit</div>
+            </>
+          ) : (
+            <div className="timeline"><div className="tl-empty">Give a part start/end times to build the timeline.</div></div>
+          )}
         </div>
       )}
 
@@ -621,10 +739,7 @@ export default function FretDeck() {
           <div className="lib-head">Songs</div>
           {songs.map((s) => (
             <div key={s.id} className={"song-item" + (s.id === activeSongId ? " active" : "")} onClick={() => setActiveSongId(s.id)}>
-              <div className="t">
-                {s.title || "Untitled"}
-                <div className="n">{(s.parts || []).length} parts</div>
-              </div>
+              <div className="t">{s.title || "Untitled"}<div className="n">{(s.arrangement || []).length} parts</div></div>
               <button className="del" title="Delete song" onClick={(e) => { e.stopPropagation(); removeSong(s.id); }}>×</button>
             </div>
           ))}
@@ -635,195 +750,124 @@ export default function FretDeck() {
           {activeSong ? (
             <>
               <div className="meta">
-                <div className="field f-title">
-                  <label>Song</label>
-                  <input value={activeSong.title} onChange={(e) => updateActiveSong((s) => (s.title = e.target.value))} />
-                </div>
-                <div className="field f-artist">
-                  <label>Artist</label>
-                  <input value={activeSong.artist || ""} onChange={(e) => updateActiveSong((s) => (s.artist = e.target.value))} />
-                </div>
-                <div className="field f-url">
-                  <label>YouTube URL</label>
+                <div className="field f-title"><label>Song</label>
+                  <input value={activeSong.title} onChange={(e) => updateActiveSong((s) => (s.title = e.target.value))} /></div>
+                <div className="field f-artist"><label>Artist</label>
+                  <input value={activeSong.artist || ""} onChange={(e) => updateActiveSong((s) => (s.artist = e.target.value))} /></div>
+                <div className="field f-url"><label>YouTube URL</label>
                   <input value={activeSong.youtubeUrl || ""} placeholder="https://www.youtube.com/watch?v=…"
-                    onChange={(e) => updateActiveSong((s) => (s.youtubeUrl = e.target.value))} />
+                    onChange={(e) => updateActiveSong((s) => (s.youtubeUrl = e.target.value))} /></div>
+              </div>
+
+              <div className="parts-panel">
+                <div className="pp-head">
+                  <span className="sec-label">Parts</span>
+                  <span className="pp-hint">single-click to jump · double-click to edit</span>
+                  <button className="add-part-sm" onClick={addPart}>+ Add part</button>
+                </div>
+                <div className="chips">
+                  {placements.map((plc) => {
+                    const p = partById[plc.partId];
+                    const linked = arrangement.filter((a) => a.partId === plc.partId).length > 1;
+                    return (
+                      <button key={plc.id}
+                        className={"pchip" + (plc.id === activePlacementId ? " active" : "") + (plc.id === currentPlacementId ? " playing" : "")}
+                        onClick={() => { setActivePlacementId(plc.id); const a = parseTime(plc.start); if (a != null) seekTo(a, true); }}
+                        onDoubleClick={() => openEditor(plc.id)}>
+                        <span className="d" style={{ background: typeColor(p?.type) }} />
+                        <span className="pn">{p?.name}{linked ? " ⟲" : ""}</span>
+                        <span className="pt">{rangeLabel(plc)}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
-              <div className="workspace">
-                {/* ---- context column ---- */}
-                <section className="context">
-                  <div className="tube">
-                    <div className="ratio">
-                      <div className="yt-host" ref={ytHostRef} />
-                      {!vid && <div className="empty">Paste a YouTube link above to listen along.</div>}
+              {editorOpen && activePart ? (
+                <section className="edit-col">
+                  <div className="editor">
+                    <div className="ed-title">
+                      <span>Editing: <b>{activePart.name}</b>{linkCount > 1 ? <span className="linkbadge">⟲ linked ×{linkCount}</span> : null}</span>
+                      <span className="ed-acts">
+                        <button className="txtbtn" onClick={() => repeatPlacement(activePlacement)}>⟲ Repeat</button>
+                        {linkCount > 1 && <button className="txtbtn" onClick={() => makeIndependent(activePlacement)}>Make a copy</button>}
+                        <button className="txtbtn danger" onClick={() => deletePlacement(activePlacement.id)}>× Delete</button>
+                        <button className="txtbtn" onClick={() => setEditorOpen(false)} title="Collapse (Esc)">✕ Close</button>
+                      </span>
                     </div>
-                  </div>
+                    {linkCount > 1 && (
+                      <div className="link-note">This part repeats {linkCount}× — edits here apply to all of them. Use “Make a copy” to change just this one.</div>
+                    )}
+                    <div className="ed-head">
+                      <div className="field f-name"><label>Part name</label>
+                        <input value={activePart.name} onChange={(e) => updatePart((p) => (p.name = e.target.value))} /></div>
+                      <div className="field"><label>Type</label>
+                        <input list="part-types" value={activePart.type} placeholder="Verse, Pre-chorus…"
+                          onChange={(e) => updatePart((p) => (p.type = e.target.value))} /></div>
+                      <div className="field f-time"><label>Start</label>
+                        <input placeholder="0:00" value={activePlacement.start} onChange={(e) => updatePlacement(activePlacement.id, (a) => (a.start = e.target.value))} /></div>
+                      <div className="field f-time"><label>End</label>
+                        <input placeholder="0:00" value={activePlacement.end} onChange={(e) => updatePlacement(activePlacement.id, (a) => (a.end = e.target.value))} /></div>
+                    </div>
 
-                  <div className="map-head">
-                    <span className="sec-label">Song map</span>
-                    <label className="follow">
-                      <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />
-                      follow playback
-                    </label>
-                  </div>
-                  {segList.length ? (
-                    <div className="timeline-track" ref={trackRef} onPointerDown={onTrackDown} style={{ height: 14 + laneCount * 40 }}>
-                      {placed.map((s) => {
-                        const p = ordered.find((x) => x.id === s.id);
-                        const left = ((s.a - mapStart) / mapSpan) * 100;
-                        const width = Math.max(2.5, ((s.b - s.a) / mapSpan) * 100);
+                    <div className="fx">
+                      <div className="field"><label>Drive</label>
+                        <select value={activePart.fx.drive} onChange={(e) => updatePart((p) => (p.fx.drive = e.target.value))}>{DRIVES.map((d) => (<option key={d}>{d}</option>))}</select></div>
+                      <div className="field f-delay"><label>Delay (ms)</label>
+                        <input type="number" placeholder="0" value={activePart.fx.delay} onChange={(e) => updatePart((p) => (p.fx.delay = e.target.value))} /></div>
+                      <div className="field"><label>Reverb</label>
+                        <select value={activePart.fx.reverb} onChange={(e) => updatePart((p) => (p.fx.reverb = e.target.value))}>{REVERBS.map((r) => (<option key={r}>{r}</option>))}</select></div>
+                      <div className="field f-other"><label>Other FX</label>
+                        <input placeholder="chorus, wah, octave…" value={activePart.fx.other} onChange={(e) => updatePart((p) => (p.fx.other = e.target.value))} /></div>
+                      <div className="field f-notes"><label>Notes</label>
+                        <input placeholder="capo 2, drop D…" value={activePart.fx.notes} onChange={(e) => updatePart((p) => (p.fx.notes = e.target.value))} /></div>
+                    </div>
+
+                    <div className="sheet" tabIndex={0} ref={sheetRef} onKeyDown={onKey}>
+                      {Array.from({ length: systemCount }, (_, sys) => {
+                        const start = sys * ROW_SLOTS;
                         return (
-                          <div key={s.id}
-                            className={"tl-block" + (p.id === activePart?.id ? " active" : "") + (s.id === currentPartId ? " playing" : "")}
-                            style={{ left: left + "%", width: width + "%", top: 7 + s.lane * 40, height: 34, background: typeColor(p.type) }}
-                            onClick={() => setActivePartId(p.id)}>
-                            <div className="nm">{p.name}</div>
-                            <div className="tm">{rangeLabel(p)}</div>
+                          <div className="system" key={sys}>
+                            <div className="sys-head">bars {sys * 2 + 1}–{sys * 2 + 2}</div>
+                            {STRINGS.map((s, si) => (
+                              <div className="grow" key={si}>
+                                <div className="gut">{s}</div>
+                                <div className="lane">
+                                  {Array.from({ length: ROW_SLOTS }, (_, j) => {
+                                    const ci = start + j;
+                                    const midClass = j === BAR ? " mid" : "";
+                                    if (ci >= activePart.slots.length) return <div className={"cell pad" + midClass} key={j} />;
+                                    const v = activePart.slots[ci][si];
+                                    const isSel = sel && sel.slot === ci && sel.str === si;
+                                    return (
+                                      <div key={j} className={"cell" + midClass + (isSel ? " sel" : "")}
+                                        onClick={() => { setSel({ slot: ci, str: si }); sheetRef.current?.focus(); }}>
+                                        {v == null ? <span className="dot" /> : <span className="num">{v}</span>}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            ))}
                           </div>
                         );
                       })}
-                      <div className="playhead" ref={playheadRef} />
+                      <div className="sheet-foot">
+                        <button className="mini" onClick={() => addSlots(BAR)}>+ bar</button>
+                        <button className="mini" onClick={() => addSlots(4)}>+ 4 slots</button>
+                        <button className="mini" onClick={delSlot}>– slot</button>
+                        <button className="mini" onClick={clearTab}>clear</button>
+                      </div>
                     </div>
-                  ) : (
-                    <div className="timeline"><div className="tl-empty">Add start/end times to a part to build the timeline.</div></div>
-                  )}
-                  <div className="scrub-hint">Click or drag the map to scrub the song</div>
 
-                  <div className="sec-label" style={{ marginTop: 16 }}>Parts</div>
-                  <div className="parts-scroll">
-                    <div className="road">
-                      {activeSong.parts.map((p, idx) => (
-                        <div key={p.id}
-                          className={"road-row" + (p.id === activePart?.id ? " active" : "") + (p.id === currentPartId ? " playing" : "") + (dragOver === idx ? " dragover" : "")}
-                          onClick={() => setActivePartId(p.id)}
-                          onDragOver={(e) => { e.preventDefault(); if (dragOver !== idx) setDragOver(idx); }}
-                          onDrop={(e) => { e.preventDefault(); reorderParts(dragIndexRef.current, idx); dragIndexRef.current = null; setDragOver(null); }}
-                          onDragEnd={() => { dragIndexRef.current = null; setDragOver(null); }}>
-                          <span className="grip" title="Drag to reorder" draggable
-                            onDragStart={(e) => { dragIndexRef.current = idx; e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", String(idx)); }}
-                            onClick={(e) => e.stopPropagation()}>⠿</span>
-                          <span className="chip" style={{ background: typeColor(p.type) }} />
-                          <span className="time">{rangeLabel(p)}</span>
-                          <div className="info">
-                            <div><span className="nm">{p.name}</span><span className="ty">{p.type}</span></div>
-                            <div className="fx">{fxSummary(p.fx)}</div>
-                          </div>
-                          <div className="acts">
-                            <button className="iconbtn" title="Play from here" onClick={(e) => { e.stopPropagation(); playFrom(p); }}>▶</button>
-                            <button className="iconbtn" title="Duplicate" onClick={(e) => { e.stopPropagation(); duplicatePart(p); }}>⧉</button>
-                            <button className="iconbtn danger" title="Delete" onClick={(e) => { e.stopPropagation(); deletePart(p.id); }}>×</button>
-                          </div>
-                        </div>
-                      ))}
+                    <div className="palette">
+                      <span className="pl">Fret</span>
+                      {Array.from({ length: 16 }, (_, f) => (<button key={f} className="fret" onClick={() => setFret(f, true)}>{f}</button>))}
+                      <button className="fret special" onClick={() => setFret("x", true)}>x</button>
+                      <button className="fret special" onClick={() => setFret(null, false)}>⌫</button>
                     </div>
+                    <div className="hint">Click a cell, then a fret (auto-advances). Keys: <kbd>0–24</kbd> fret · <kbd>← ↑ ↓ →</kbd> move · <kbd>x</kbd> mute · <kbd>⌫</kbd> clear · <kbd>space</kbd> next.</div>
                   </div>
-                  <button className="add-part" onClick={addPart}>+ Add part</button>
-                </section>
-
-                {/* ---- editor column ---- */}
-                <section className="edit-col">
-                  {activePart ? (
-                    <div className="editor">
-                      <div className="ed-title">Editing: <b>{activePart.name}</b></div>
-                      <div className="ed-head">
-                        <div className="field f-name">
-                          <label>Part name</label>
-                          <input value={activePart.name} onChange={(e) => updateActivePart((p) => (p.name = e.target.value))} />
-                        </div>
-                        <div className="field">
-                          <label>Type</label>
-                          <input list="part-types" value={activePart.type} placeholder="Verse, Pre-chorus…"
-                            onChange={(e) => updateActivePart((p) => (p.type = e.target.value))} />
-                        </div>
-                        <div className="field f-time">
-                          <label>Start</label>
-                          <input placeholder="0:00" value={activePart.start} onChange={(e) => updateActivePart((p) => (p.start = e.target.value))} />
-                        </div>
-                        <div className="field f-time">
-                          <label>End</label>
-                          <input placeholder="0:00" value={activePart.end} onChange={(e) => updateActivePart((p) => (p.end = e.target.value))} />
-                        </div>
-                      </div>
-
-                      <div className="fx">
-                        <div className="field">
-                          <label>Drive</label>
-                          <select value={activePart.fx.drive} onChange={(e) => updateActivePart((p) => (p.fx.drive = e.target.value))}>
-                            {DRIVES.map((d) => (<option key={d}>{d}</option>))}
-                          </select>
-                        </div>
-                        <div className="field f-delay">
-                          <label>Delay (ms)</label>
-                          <input type="number" placeholder="0" value={activePart.fx.delay} onChange={(e) => updateActivePart((p) => (p.fx.delay = e.target.value))} />
-                        </div>
-                        <div className="field">
-                          <label>Reverb</label>
-                          <select value={activePart.fx.reverb} onChange={(e) => updateActivePart((p) => (p.fx.reverb = e.target.value))}>
-                            {REVERBS.map((r) => (<option key={r}>{r}</option>))}
-                          </select>
-                        </div>
-                        <div className="field f-other">
-                          <label>Other FX</label>
-                          <input placeholder="chorus, wah, octave…" value={activePart.fx.other} onChange={(e) => updateActivePart((p) => (p.fx.other = e.target.value))} />
-                        </div>
-                        <div className="field f-notes">
-                          <label>Notes</label>
-                          <input placeholder="capo 2, drop D…" value={activePart.fx.notes} onChange={(e) => updateActivePart((p) => (p.fx.notes = e.target.value))} />
-                        </div>
-                      </div>
-
-                      <div className="sheet" tabIndex={0} ref={sheetRef} onKeyDown={onKey}>
-                        {Array.from({ length: systemCount }, (_, sys) => {
-                          const start = sys * BAR;
-                          return (
-                            <div className="system" key={sys}>
-                              <div className="sys-head">bar {sys + 1}</div>
-                              {STRINGS.map((s, si) => (
-                                <div className="grow" key={si}>
-                                  <div className="gut">{s}</div>
-                                  <div className="lane">
-                                    {Array.from({ length: BAR }, (_, j) => {
-                                      const ci = start + j;
-                                      if (ci >= activePart.slots.length) return <div className="cell pad" key={j} />;
-                                      const v = activePart.slots[ci][si];
-                                      const isSel = sel && sel.slot === ci && sel.str === si;
-                                      return (
-                                        <div key={j} className={"cell" + (isSel ? " sel" : "")}
-                                          onClick={() => { setSel({ slot: ci, str: si }); sheetRef.current?.focus(); }}>
-                                          {v == null ? <span className="dot" /> : <span className="num">{v}</span>}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          );
-                        })}
-                        <div className="sheet-foot">
-                          <button className="mini" onClick={() => addSlots(BAR)}>+ bar</button>
-                          <button className="mini" onClick={() => addSlots(4)}>+ 4 slots</button>
-                          <button className="mini" onClick={delSlot}>– slot</button>
-                          <button className="mini" onClick={clearPart}>clear</button>
-                        </div>
-                      </div>
-
-                      <div className="palette">
-                        <span className="pl">Fret</span>
-                        {Array.from({ length: 16 }, (_, f) => (
-                          <button key={f} className="fret" onClick={() => setFret(f, true)}>{f}</button>
-                        ))}
-                        <button className="fret special" onClick={() => setFret("x", true)}>x</button>
-                        <button className="fret special" onClick={() => setFret(null, false)}>⌫</button>
-                      </div>
-                      <div className="hint">
-                        Click a cell, then a fret (auto-advances). Keys: <kbd>0–24</kbd> fret · <kbd>← ↑ ↓ →</kbd> move · <kbd>x</kbd> mute · <kbd>⌫</kbd> clear · <kbd>space</kbd> next.
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="editor"><div className="loading">Select a part on the left to edit it.</div></div>
-                  )}
 
                   <div className="exports">
                     <button className="btn primary" onClick={() => exportPdf(activeSong)}>Download PDF</button>
@@ -834,7 +878,19 @@ export default function FretDeck() {
                     <input ref={fileRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importJson} />
                   </div>
                 </section>
-              </div>
+              ) : (
+                <div className="edit-closed">
+                  <span>Double-click a part to edit its tab &amp; tone.</span>
+                  <div className="ec-exports">
+                    <button className="btn primary" onClick={() => exportPdf(activeSong)}>Download PDF</button>
+                    <button className="btn" onClick={() => copyToClip(buildAscii(activeSong), "Tab text copied")}>Copy tab text</button>
+                    <button className="btn" onClick={() => copyToClip(typeof window !== "undefined" ? window.location.href : "", "App link copied")}>Copy app link</button>
+                    <button className="btn" onClick={exportJson}>Export JSON</button>
+                    <button className="btn" onClick={() => fileRef.current?.click()}>Import JSON</button>
+                    <input ref={fileRef} type="file" accept="application/json" style={{ display: "none" }} onChange={importJson} />
+                  </div>
+                </div>
+              )}
             </>
           ) : (
             <div className="loading">{loading ? "Loading library…" : "No song selected — add one on the left."}</div>
