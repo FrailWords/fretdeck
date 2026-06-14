@@ -1,23 +1,16 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "crypto";
-import { listSongs, saveSong, hasDb } from "@/lib/db";
+import { saveSong } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
-  try {
-    const songs = await listSongs();
-    return NextResponse.json({ songs, hasDb });
-  } catch (e) {
-    return NextResponse.json({ error: String(e), songs: [], hasDb }, { status: 500 });
-  }
-}
-
 export async function POST(req) {
   try {
+    const token = new URL(req.url).searchParams.get("token");
     const body = await req.json();
     const song = { ...body, id: body.id || randomUUID() };
-    await saveSong(song);
+    const r = await saveSong(song, token);
+    if (r.error) return NextResponse.json(r, { status: 403 });
     return NextResponse.json({ song });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });

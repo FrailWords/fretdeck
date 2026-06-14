@@ -81,3 +81,23 @@ lib/
 
 Data model: each song is one Postgres row — `songs(id text pk, data jsonb, updated_at)` — with
 the parts/FX/tabs stored in the `data` JSON. Simple to query, easy to back up.
+
+---
+
+## Collections & sharing (URLs)
+
+Songs live in **collections** — each a shareable set with its own links.
+
+- **`/`** is your dashboard: every collection, create new, open by link. Keep this URL private — treat it as your admin page.
+- **`/c/{editToken}`** opens a collection with edit access (for your band).
+- **`/c/{viewToken}`** opens it **read-only** (for sharing / showing off the app).
+- **`/c/{token}/{songId}`** deep-links a single song.
+
+Use the **Share** button in the app (or "Copy view/edit link" on the dashboard) to grab links.
+A shared link opens the live app — no PDF needed — and read-only visitors get a "make your own"
+prompt. Per-song edits are authorized server-side against the collection's edit token, so a
+view link genuinely can't change anything.
+
+Note: there are no user accounts yet, so the dashboard at `/` lists all collections to whoever
+opens it — keep that root URL to yourself and share the per-collection links. Accounts/log-in
+would be the next step to gate the dashboard.

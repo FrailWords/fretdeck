@@ -1,32 +1,29 @@
 import { NextResponse } from "next/server";
-import { getSong, saveSong, deleteSong } from "@/lib/db";
+import { saveSong, deleteSong } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
-
-export async function GET(_req, { params }) {
-  const { id } = await params;
-  const song = await getSong(id);
-  if (!song) return NextResponse.json({ error: "Not found" }, { status: 404 });
-  return NextResponse.json({ song });
-}
 
 export async function PUT(req, { params }) {
   try {
     const { id } = await params;
+    const token = new URL(req.url).searchParams.get("token");
     const body = await req.json();
     const song = { ...body, id };
-    await saveSong(song);
+    const r = await saveSong(song, token);
+    if (r.error) return NextResponse.json(r, { status: 403 });
     return NextResponse.json({ song });
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
 }
 
-export async function DELETE(_req, { params }) {
+export async function DELETE(req, { params }) {
   try {
     const { id } = await params;
-    await deleteSong(id);
-    return NextResponse.json({ ok: true });
+    const token = new URL(req.url).searchParams.get("token");
+    const r = await deleteSong(id, token);
+    if (r.error) return NextResponse.json(r, { status: 403 });
+    return NextResponse.json(r);
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 500 });
   }
